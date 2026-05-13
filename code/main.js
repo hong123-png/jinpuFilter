@@ -761,26 +761,33 @@ async function scrapeListingRows(listingPage) {
   await stepBreath(listingPage);
 
   const results = [];
-  for (const { sku, rowIndex } of skuRows) {
-    debugLog('SKU 循环', { sku, rowIndex });
-    await clickConfirmCloseIfPresent(listingPage);
-    await stepBreath(listingPage);
-    await listingPage.getByRole('textbox', { name: 'SKU' }).fill(sku);
-    await stepBreath(listingPage);
-    await listingPage.getByRole('button', { name: '查询' }).click();
-    debugLog('已点查询，等待 10s');
-    await listingPage.waitForTimeout(10000);
-    const rows = await scrapeListingRows(listingPage);
-    const first = rows[0] ?? {};
-    let label = deriveSecondColumnLabel(first);
-    debugLog('列表推导结论', { sku, label, listRowSample: first });
-    label = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
-    labelsByRowIndex.set(rowIndex, label);
-    results.push({ sku, rows, label });
-  }
+  try {
+    for (const { sku, rowIndex } of skuRows) {
+      debugLog('SKU 循环', { sku, rowIndex });
+      if (labelsByRowIndex.has(rowIndex)) {
+        debugLog(`SKU ${sku} 已有结果，跳过`, { sku, rowIndex, label: labelsByRowIndex.get(rowIndex) });
+        continue;
+      }
 
-  writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex);
-  await writeXlsxWithRetry(wb, excelPath);
+      await clickConfirmCloseIfPresent(listingPage);
+      await stepBreath(listingPage);
+      await listingPage.getByRole('textbox', { name: 'SKU' }).fill(sku);
+      await stepBreath(listingPage);
+      await listingPage.getByRole('button', { name: '查询' }).click();
+      debugLog('已点查询，等待 10s');
+      await listingPage.waitForTimeout(10000);
+      const rows = await scrapeListingRows(listingPage);
+      const first = rows[0] ?? {};
+      let label = deriveSecondColumnLabel(first);
+      debugLog('列表推导结论', { sku, label, listRowSample: first });
+      label = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
+      labelsByRowIndex.set(rowIndex, label);
+      results.push({ sku, rows, label });
+    }
+  } finally {
+    writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex);
+    await writeXlsxWithRetry(wb, excelPath);
+  }
 
   console.log(JSON.stringify(results, null, 2));
   console.error(`已写回第二列: ${excelPath}`);
