@@ -31,6 +31,7 @@
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const readline = require('readline');
 const XLSX = require('xlsx');
 
 const CLI_ARGS = process.argv.slice(2).filter((a) => !String(a).startsWith('-'));
@@ -40,6 +41,7 @@ const DEBUG =
   process.argv.includes('-d');
 const TRACE = process.argv.includes('--trace');
 const PAUSE_BEFORE_VARIANT = process.argv.includes('--pause');
+const CONFIRM_MODE = process.argv.includes('--confirm');
 
 /** 每步成功后的短暂停顿，给接口/DOM 一点时间（主要靠 waitFor；此项兜底弱网）。 */
 function resolveStepGapMs() {
@@ -50,6 +52,23 @@ function resolveStepGapMs() {
   return Number.isFinite(n) && n >= 0 ? n : 350;
 }
 const STEP_GAP_MS = resolveStepGapMs();
+let confirmEnabled = CONFIRM_MODE;
+
+async function waitForConfirm(sku, label) {
+  console.error('');
+  console.error('╔════════════════════════════════════════════════════════════════╗');
+  console.error(`║ [确认模式] SKU=${sku}  判断结果: ${label}`);
+  console.error('║ 按 Enter 继续下一个 SKU；输入 off 关闭确认模式自动运行');
+  console.error('╚════════════════════════════════════════════════════════════════╝');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const answer = await new Promise((resolve) => rl.question('', resolve));
+  rl.close();
+  const cmd = answer.trim().toLowerCase();
+  if (cmd === 'off' || cmd === 'auto' || cmd === 'close') {
+    confirmEnabled = false;
+    console.error('[jinpu] 确认模式已关闭，后续 SKU 自动运行');
+  }
+}
 
 async function stepBreath(page) {
   if (STEP_GAP_MS > 0 && page) await page.waitForTimeout(STEP_GAP_MS);
@@ -147,8 +166,8 @@ function resolveSkuExcelPath() {
   return out;
 }
 
-/** 读取工作簿，返回首表 A 列为纯数字的 SKU 所在行（0-based 行号） */
-function loadSkuRowsFromWorkbook(filePath) {
+/** 读取工作簿，返回首表 A 列为纯数字的 SKU 所在行（0-based 行号）；B 列已有判断结果的行跳过并记入 labelsByRowIndex */
+function loadSkuRowsFromWorkbook(filePath, labelsByRowIndex) {
   const wb = XLSX.readFile(filePath);
   const sheetName = wb.SheetNames[0];
   const sheet = wb.Sheets[sheetName];
@@ -157,6 +176,11 @@ function loadSkuRowsFromWorkbook(filePath) {
   matrix.forEach((row, rowIndex) => {
     const s = String(row[0] ?? '').trim();
     if (!s || !/^\d+$/.test(s)) return; // 跳过表头或非数字 SKU
+    const existingLabel = String(row[1] ?? '').trim();
+    if (existingLabel) {
+      labelsByRowIndex.set(rowIndex, existingLabel);
+      return;
+    }
     skuRows.push({ sku: s, rowIndex });
   });
   return { wb, sheetName, matrix, skuRows };
@@ -383,13 +407,14 @@ async function checkAllVariantsHaveListingImages(page, meta = {}) {
     for (let i = 0; i < n; i++) {
       const row = rows.nth(i);
       const btn = row.getByRole('button', { name: '选择图片' });
-      if ((await btn.count()) === 0) {
+      try {
+        await btn.click({ timeout: 12_000 });
+      } catch {
         console.error(`[jinpu] 选图检查 SKU=${sku} 变体行#${i + 1}(index=${i}) 无「选择图片」按钮 => 跳过该行`);
         continue;
       }
 
       openedPicker += 1;
-      await btn.click({ timeout: 12_000 });
       await page.waitForTimeout(700);
 
       const boxLoc = page.locator(boxSelector).first();
@@ -618,6 +643,7 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
 function writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex) {
   const next = matrix.map((row) => [...row]);
   for (const { rowIndex } of skuRows) {
+    if (rowIndex >= next.length) continue;
     const label = labelsByRowIndex.get(rowIndex) ?? '';
     while (next[rowIndex].length < 2) next[rowIndex].push('');
     next[rowIndex][1] = label;
@@ -680,7 +706,7 @@ async function gotoWithRetry(
     } catch (e) {
       lastErr = e;
       const msg = String(e?.message || e);
-      const retryable = /ERR_CONNECTION|TIMED_OUT|timeout|Navigation|RESET|REFUSED|ABORTED|ENOTFOUND/i.test(
+      const retryable = /ERR_CONNECTION|TIMED_OUT|timeout|Navigation|RESET|REFUSED|ABORTED/i.test(
         msg
       );
       if (retryable && i < attempts) {
@@ -727,10 +753,11 @@ async function scrapeListingRows(listingPage) {
     `[jinpu] STEP_GAP_MS=${STEP_GAP_MS}（每步成功后停顿；弱网可调大、设 JINPU_STEP_GAP_MS=0 关闭、或 node ... --slow）`
   );
   const excelPath = resolveSkuExcelPath();
-  const { wb, sheetName, matrix, skuRows } = loadSkuRowsFromWorkbook(excelPath);
   const labelsByRowIndex = new Map();
+  const { wb, sheetName, matrix, skuRows } = loadSkuRowsFromWorkbook(excelPath, labelsByRowIndex);
 
   const browser = await chromium.launch({ headless: false });
+  try {
   const context = await browser.newContext();
   if (TRACE) {
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
@@ -760,7 +787,13 @@ async function scrapeListingRows(listingPage) {
   await listingPage.getByText('产品列表', { exact: true }).click();
   await stepBreath(listingPage);
 
+  const NETWORK_ERR_THRESHOLD = 5;
+  const isNetworkError = (e) => /ERR_CONNECTION|TIMED_OUT|timeout|RESET|REFUSED|ABORTED|net::/i.test(
+    e instanceof Error ? e.message : String(e)
+  );
+
   const results = [];
+  let networkErrCount = 0;
   try {
     for (const { sku, rowIndex } of skuRows) {
       debugLog('SKU 循环', { sku, rowIndex });
@@ -769,20 +802,47 @@ async function scrapeListingRows(listingPage) {
         continue;
       }
 
-      await clickConfirmCloseIfPresent(listingPage);
-      await stepBreath(listingPage);
-      await listingPage.getByRole('textbox', { name: 'SKU' }).fill(sku);
-      await stepBreath(listingPage);
-      await listingPage.getByRole('button', { name: '查询' }).click();
-      debugLog('已点查询，等待 10s');
-      await listingPage.waitForTimeout(10000);
-      const rows = await scrapeListingRows(listingPage);
-      const first = rows[0] ?? {};
-      let label = deriveSecondColumnLabel(first);
-      debugLog('列表推导结论', { sku, label, listRowSample: first });
-      label = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
-      labelsByRowIndex.set(rowIndex, label);
-      results.push({ sku, rows, label });
+      try {
+        await clickConfirmCloseIfPresent(listingPage);
+        await stepBreath(listingPage);
+        await listingPage.getByRole('textbox', { name: 'SKU' }).fill(sku);
+        await stepBreath(listingPage);
+        await listingPage.getByRole('button', { name: '查询' }).click();
+        debugLog('已点查询，等待 10s');
+        await listingPage.waitForTimeout(10000);
+        const rows = await scrapeListingRows(listingPage);
+        const first = rows[0] ?? {};
+        let label = deriveSecondColumnLabel(first);
+        debugLog('列表推导结论', { sku, label, listRowSample: first });
+        label = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
+        labelsByRowIndex.set(rowIndex, label);
+        results.push({ sku, rows, label });
+        networkErrCount = 0;
+        if (confirmEnabled) await waitForConfirm(sku, label);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[jinpu] SKU=${sku} 处理失败，跳过: ${msg}`);
+        labelsByRowIndex.set(rowIndex, '处理异常');
+        if (isNetworkError(err)) {
+          networkErrCount += 1;
+          if (networkErrCount >= NETWORK_ERR_THRESHOLD) {
+            console.error(
+              `[jinpu] 连续 ${networkErrCount} 个 SKU 因网络问题失败，停止后续处理。请检查网络/VPN后重新运行。`
+            );
+            break;
+          }
+        } else {
+          networkErrCount = 0;
+        }
+        try {
+          await clickConfirmCloseIfPresent(listingPage);
+          await listingPage.keyboard.press('Escape');
+          await clickConfirmCloseIfPresent(listingPage);
+          await listingPage.waitForTimeout(500);
+        } catch {
+          /* ignore cleanup errors */
+        }
+      }
     }
   } finally {
     writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex);
@@ -797,5 +857,7 @@ async function scrapeListingRows(listingPage) {
     await context.tracing.stop({ path: tracePath });
     console.error(`[jinpu] trace 已保存: ${tracePath} （查看: npx playwright show-trace "${tracePath}"）`);
   }
-  await browser.close();
+  } finally {
+    await browser.close();
+  }
 })();
