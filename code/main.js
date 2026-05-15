@@ -24,9 +24,11 @@
  *   V08_J6_CLICK       点选「J6」
  *   V09_TBODY_WAIT     在「产品信息」标题并列的 div.body 内等待变体行（header/body 并行结构）
  *   V10_TABLE_STABLE   再等 3s
- *   V11_SCRAPE         抓取变体产品状态
- *   V11B_VARIANT_IMAGES 状态均通过后逐行点「选择图片」，检查弹层 div.box 内是否有配图
- *   V12_CLOSE_DIALOG   关刊登向导：取消 → 确定关闭（与手动两步一致）
+ *   V11_SKU_NodeID  列表页「产品信息」区块抓 SKU 对应的 Node ID
+ *   V12_SKU_Title 列表页「产品信息」区块抓 SKU 对应的标题
+ *   V13_SCRAPE         抓取变体产品状态
+ *   V13B_VARIANT_IMAGES 状态均通过后逐行点「选择图片」，检查弹层 div.box 内是否有配图
+ *   V14_CLOSE_DIALOG   关刊登向导：取消 → 确定关闭（与手动两步一致）
  */
 const { chromium } = require('playwright');
 const path = require('path');
@@ -257,8 +259,9 @@ function listingProductInfoBody(page) {
  */
 async function clickConfirmCloseIfPresent(page) {
   const ok = page.getByRole('button', { name: '确定关闭' });
+  if (await ok.count() === 0) return;
   try {
-    await ok.waitFor({ state: 'visible', timeout: 12_000 });
+    await ok.waitFor({ state: 'visible', timeout: 3_000 });
     await ok.click({ timeout: 15_000 });
     await page.waitForTimeout(400);
   } catch {
@@ -472,6 +475,15 @@ async function checkAllVariantsHaveListingImages(page, meta = {}) {
   }
 }
 
+
+async function getValue(el) {
+try {
+  const val = await el.inputValue();
+  if (val) return val;
+} catch (e) {}
+  return (await el.textContent()) || (await el.innerText()) || '';
+}
+
 /**
  * 列表判定为「可刊登」时：点「精细刊登」→「下一步」→ 选店铺 J6，根据产品信息表里各变体「产品状态」覆盖结论。
  * 同页弹层、无整页跳转；结束后尝试关闭弹层以便继续查下一 SKU。
@@ -580,8 +592,45 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
       }
     );
 
+    const SkuNodeId = await runPlaywrightStep(
+      'V11_SKU_NODEID',
+      '列表页「产品信息」区块抓 SKU 对应的 Node ID',
+      stepCtx,
+      async () => {
+        const productNodeId = listingPage.getByText('Node ID').first();
+        const nextElement = productNodeId.locator('xpath=following-sibling::*[1]');
+        const NodeIdInput = nextElement.locator('input').first();
+        await NodeIdInput.waitFor({ state: 'visible', timeout: 10000 });
+        const nodeId = await getValue(NodeIdInput);
+        return nodeId;
+      }
+    );
+    console.error(`[jinpu] 抓 SKU Node ID: ${SkuNodeId}`);
+
+    const SkuTitle = await runPlaywrightStep(
+      'V12_SKU_TITLE',
+      '列表页「产品信息」区块抓 SKU 对应的标题',
+      stepCtx,
+      async () => {
+        const targetElement = listingPage.getByText('产品标题').nth(1);
+        const nextElement2 = targetElement.locator('xpath=following-sibling::*[1]');
+        const textarea = nextElement2.locator('textarea').first();
+        await textarea.waitFor({ state: 'visible', timeout: 10000 });
+        const title = await getValue(textarea);
+        return title;
+      }
+    );
+    console.error(`[jinpu] 抓 SKU 标题: ${SkuTitle}`);
+
+    await runPlaywrightStep(
+      '13_SCRAPE',
+      'evaluate：仅在「产品信息」并列 div.body 内抓取变体「产品状态」',
+      stepCtx,
+      async () => scrapeTid172VariantStatuses(listingPage)
+    );
+
     const scraped = await runPlaywrightStep(
-      'V11_SCRAPE',
+      'V13_SCRAPE',
       'evaluate：仅在「产品信息」并列 div.body 内抓取变体「产品状态」',
       stepCtx,
       async () => scrapeTid172VariantStatuses(listingPage)
@@ -593,7 +642,7 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
     let imagesCheck = 'skipped';
     if (!statusIssue) {
       const imagesOk = await runPlaywrightStep(
-        'V11B_VARIANT_IMAGES',
+        'V13B_VARIANT_IMAGES',
         '逐行点「选择图片」，检查弹层 div.box 内 li.image_box img 是否有有效 src',
         stepCtx,
         async () => checkAllVariantsHaveListingImages(listingPage, { sku })
@@ -608,7 +657,7 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
     debugLog('variant-flow 结束', { sku, out, scraped });
 
     await runPlaywrightStep(
-      'V12_CLOSE_DIALOG',
+      'V14_CLOSE_DIALOG',
       '关闭刊登向导：getByRole 取消 → getByRole 确定关闭',
       stepCtx,
       async () => {
@@ -617,7 +666,9 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
         await listingPage.waitForTimeout(500);
       }
     );
-    return out;
+    console.error(`[jinpu] variant-flow 全部步骤完成，SKU=${sku} 最终结论: ${out}`);
+    return { out, SkuNodeId, SkuTitle };
+    // return out;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const failedStep = err instanceof Error ? err.jinpuFailedStep : undefined;
@@ -641,6 +692,7 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
 
 /** 把每行算好的第二列写回 matrix，再生成 sheet（首行非数字时第二列表头为「判断结果」） */
 function writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex) {
+  console.error('labelsByRowIndex', labelsByRowIndex);
   const next = matrix.map((row) => [...row]);
   for (const { rowIndex } of skuRows) {
     if (rowIndex >= next.length) continue;
@@ -768,10 +820,11 @@ async function scrapeListingRows(listingPage) {
   // --- 登录主站（账号密码请按需替换，勿泄露） ---
   debugLog('打开登录页');
   await gotoWithRetry(page, 'https://saaserp-pos.yibainetwork.com/');
-  await page.getByRole('textbox', { name: '请输入手机号或邮箱' }).fill('13011019098');
-  await page.getByRole('textbox', { name: '请输入登录密码' }).fill('5&45#wAW');
+  await page.getByRole('textbox', { name: '请输入手机号或邮箱' }).fill('13011019088');
+  await page.getByRole('textbox', { name: '请输入登录密码' }).fill('4545#￥w&AW');
   await page.getByRole('button', { name: '登录' }).click();
-  await page.waitForTimeout(10000);
+  // await page.waitForTimeout(10000);
+  await page.waitForSelector('#app', { timeout: 30_000 });
 
   // 侧栏打开「刊登管理」新标签页
   await page.locator('#app > div > div.ui-content div:nth-child(1)  li:nth-child(6) > div > span').filter({ hasText: 'ERP' }).first().hover();
@@ -780,7 +833,8 @@ async function scrapeListingRows(listingPage) {
     page.getByText('刊登管理', { exact: true }).click(),
   ]);
   await listingPage.waitForLoadState('domcontentloaded');
-  await listingPage.waitForTimeout(10000);
+  // await listingPage.waitForTimeout(10000);
+  await listingPage.getByText('刊登管理', { exact: true }).waitFor({ state: 'visible', timeout: 30_000 });
 
   // 在新页进入「产品列表」
   await listingPage.locator('div').filter({ hasText: '刊登管理' }).nth(5).hover();
@@ -809,20 +863,40 @@ async function scrapeListingRows(listingPage) {
         await stepBreath(listingPage);
         await listingPage.getByRole('button', { name: '查询' }).click();
         debugLog('已点查询，等待 10s');
-        await listingPage.waitForTimeout(10000);
+        // await listingPage.waitForTimeout(10000);
+        // await listingPage.locator('tr.vxe-body--row, .vxe-table-empty-text, .no-data, :text("暂无数据")').first().waitFor({ state: 'visible', timeout: 30_000 });
+        const firstRowOrEmpty = listingPage.locator('tr.vxe-body--row, .vxe-table-empty-text, .no-data, :text("暂无数据")').first();
+        await firstRowOrEmpty.waitFor({ state: 'visible', timeout: 30_000 });
+        const noData = await listingPage.locator('.vxe-table-empty-text, .no-data, :text("暂无数据")').count() > 0;
+        if (!noData) {
+          const firstRowTds  = listingPage.locator('tr.vxe-body--row').first().locator('td');
+          await firstRowTds.nth(3).waitFor({ state: 'visible', timeout: 10_000 });
+          await firstRowTds.nth(8).waitFor({ state: 'attached', timeout: 10_000 });
+          await listingPage.waitForTimeout(800);
+        }
         const rows = await scrapeListingRows(listingPage);
         const first = rows[0] ?? {};
         let label = deriveSecondColumnLabel(first);
         debugLog('列表推导结论', { sku, label, listRowSample: first });
-        label = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
-        labelsByRowIndex.set(rowIndex, label);
-        results.push({ sku, rows, label });
+        // 调用 refineListingLabelWithVariantFlow 并返回 label, SkuNodeId, SkuTitle
+        let SkuNodeId, SkuTitle;
+
+        r = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
+        label = r.out;
+        SkuNodeId = r.SkuNodeId;
+        SkuTitle = r.SkuTitle;
+        // ({label, SkuNodeId, SkuTitle} = await refineListingLabelWithVariantFlow(listingPage, label, { sku }));
+        labelsByRowIndex.set(rowIndex, label, SkuNodeId, SkuTitle);
+        console.error(`****************************************************`);
+        console.error(`**---[jinpu] SKU=${sku} 处理完成，结论: ${label}, Node ID: ${SkuNodeId}, 标题: ${SkuTitle}---**`);
+        console.error(`****************************************************`);
+        results.push({ sku, rows, label, SkuNodeId, SkuTitle });
         networkErrCount = 0;
         if (confirmEnabled) await waitForConfirm(sku, label);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[jinpu] SKU=${sku} 处理失败，跳过: ${msg}`);
-        labelsByRowIndex.set(rowIndex, '处理异常');
+        labelsByRowIndex.set(rowIndex, '','','','处理异常');
         if (isNetworkError(err)) {
           networkErrCount += 1;
           if (networkErrCount >= NETWORK_ERR_THRESHOLD) {
