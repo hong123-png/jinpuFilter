@@ -180,7 +180,7 @@ function loadSkuRowsFromWorkbook(filePath, labelsByRowIndex) {
     if (!s || !/^\d+$/.test(s)) return; // 跳过表头或非数字 SKU
     const existingLabel = String(row[1] ?? '').trim();
     if (existingLabel) {
-      labelsByRowIndex.set(rowIndex, existingLabel);
+      labelsByRowIndex.set(rowIndex, { label: existingLabel, SkuNodeId: '', SkuTitle: '', error: '' });
       return;
     }
     skuRows.push({ sku: s, rowIndex });
@@ -493,7 +493,7 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
   const stepCtx = { page: listingPage, sku };
   if (baseLabel !== '可刊登') {
     debugLog('skip variant-flow（列表结论非「可刊登」）', { sku, baseLabel });
-    return baseLabel;
+    return {out: baseLabel, SkuNodeId: '', SkuTitle: '', error: ''}; // baseLabel;
   }
   debugLog('variant-flow 开始', { sku, baseLabel });
   try {
@@ -622,13 +622,6 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
     );
     console.error(`[jinpu] 抓 SKU 标题: ${SkuTitle}`);
 
-    await runPlaywrightStep(
-      '13_SCRAPE',
-      'evaluate：仅在「产品信息」并列 div.body 内抓取变体「产品状态」',
-      stepCtx,
-      async () => scrapeTid172VariantStatuses(listingPage)
-    );
-
     const scraped = await runPlaywrightStep(
       'V13_SCRAPE',
       'evaluate：仅在「产品信息」并列 div.body 内抓取变体「产品状态」',
@@ -667,8 +660,8 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
       }
     );
     console.error(`[jinpu] variant-flow 全部步骤完成，SKU=${sku} 最终结论: ${out}`);
-    return { out, SkuNodeId, SkuTitle };
-    // return out;
+    return {out, SkuNodeId, SkuTitle, error: ''};
+    
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const failedStep = err instanceof Error ? err.jinpuFailedStep : undefined;
@@ -686,24 +679,34 @@ async function refineListingLabelWithVariantFlow(listingPage, baseLabel, meta = 
     } catch {
       /* ignore */
     }
-    return '变体销售状态异常';
+    return {out: '', SkuNodeId: '', SkuTitle: '', error: '更详细的检查失败信息请查看前面的错误日志和截图文件'};
   }
 }
 
 /** 把每行算好的第二列写回 matrix，再生成 sheet（首行非数字时第二列表头为「判断结果」） */
-function writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex) {
-  console.error('labelsByRowIndex', labelsByRowIndex);
+function writeColumnsToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex) {
   const next = matrix.map((row) => [...row]);
   for (const { rowIndex } of skuRows) {
     if (rowIndex >= next.length) continue;
-    const label = labelsByRowIndex.get(rowIndex) ?? '';
-    while (next[rowIndex].length < 2) next[rowIndex].push('');
+    const lableByRowIndex = labelsByRowIndex.get(rowIndex);
+    const label = lableByRowIndex ? lableByRowIndex.label : '';
+    const skuNodeId = lableByRowIndex ? lableByRowIndex.SkuNodeId : '';
+    const skuTitle = lableByRowIndex ? lableByRowIndex.SkuTitle : '';
+    const error = lableByRowIndex ? lableByRowIndex.error : '';
+    // const label = labelsByRowIndex.get(rowIndex) ?? '';
+    while (next[rowIndex].length < 4) next[rowIndex].push('');
     next[rowIndex][1] = label;
+    next[rowIndex][2] = skuNodeId;
+    next[rowIndex][3] = skuTitle;
+    next[rowIndex][4] = error;
   }
   const headerA = String(next[0]?.[0] ?? '').trim();
   if (headerA && !/^\d+$/.test(headerA)) {
-    while (next[0].length < 2) next[0].push('');
+    while (next[0].length < 4) next[0].push('');
     if (!String(next[0][1] ?? '').trim()) next[0][1] = '判断结果';
+    if (!String(next[0][2] ?? '').trim()) next[0][2] = 'Node ID';
+    if (!String(next[0][3] ?? '').trim()) next[0][3] = '标题';
+    if (!String(next[0][4] ?? '').trim()) next[0][4] = '错误原因';
   }
   wb.Sheets[sheetName] = XLSX.utils.aoa_to_sheet(next);
 }
@@ -881,22 +884,23 @@ async function scrapeListingRows(listingPage) {
         // 调用 refineListingLabelWithVariantFlow 并返回 label, SkuNodeId, SkuTitle
         let SkuNodeId, SkuTitle;
 
-        r = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
+        const r = await refineListingLabelWithVariantFlow(listingPage, label, { sku });
         label = r.out;
         SkuNodeId = r.SkuNodeId;
         SkuTitle = r.SkuTitle;
+        errormsg = r.error;
         // ({label, SkuNodeId, SkuTitle} = await refineListingLabelWithVariantFlow(listingPage, label, { sku }));
-        labelsByRowIndex.set(rowIndex, label, SkuNodeId, SkuTitle);
+        labelsByRowIndex.set(rowIndex, { label, SkuNodeId, SkuTitle, error: errormsg });
         console.error(`****************************************************`);
-        console.error(`**---[jinpu] SKU=${sku} 处理完成，结论: ${label}, Node ID: ${SkuNodeId}, 标题: ${SkuTitle}---**`);
+        console.error(`**---[jinpu] SKU=${sku} 处理完成，结论: ${label}, Node ID: ${SkuNodeId}, 标题: ${SkuTitle}, 意外错误: ${errormsg}---**`);
         console.error(`****************************************************`);
-        results.push({ sku, rows, label, SkuNodeId, SkuTitle });
+        results.push({ sku, rows, label, errormsg });
         networkErrCount = 0;
         if (confirmEnabled) await waitForConfirm(sku, label);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[jinpu] SKU=${sku} 处理失败，跳过: ${msg}`);
-        labelsByRowIndex.set(rowIndex, '','','','处理异常');
+        labelsByRowIndex.set(rowIndex, { label: '', SkuNodeId: '', SkuTitle: '', error: '处理异常' });
         if (isNetworkError(err)) {
           networkErrCount += 1;
           if (networkErrCount >= NETWORK_ERR_THRESHOLD) {
@@ -919,7 +923,7 @@ async function scrapeListingRows(listingPage) {
       }
     }
   } finally {
-    writeSecondColumnToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex);
+    writeColumnsToSheet(wb, sheetName, matrix, skuRows, labelsByRowIndex);
     await writeXlsxWithRetry(wb, excelPath);
   }
 
